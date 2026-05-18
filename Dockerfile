@@ -7,6 +7,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py vpn_manager.py ./
+COPY bot.py vpn_manager.py entrypoint.sh ./
+RUN chmod +x entrypoint.sh
 
-CMD ["python", "bot.py"]
+ENTRYPOINT ["./entrypoint.sh"]

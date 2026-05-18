@@ -1,63 +1,40 @@
 # Amnezia VPN Bot
 
-Telegram-бот для управления пирами Amnezia WireGuard через SSH. Позволяет администратору просматривать список ключей со статусом онлайн/офлайн, выдавать новые ключи (QR-код + текст конфига) и отзывать существующие.
+Telegram-бот для управления пирами Amnezia WireGuard. Запускается на том же VDS что и AmneziaWG, управляет контейнером через Docker socket — без SSH и лишних зависимостей.
 
-## Требования
+## Возможности
 
-- VDS с установленным Amnezia WireGuard (`awg` / `awg-quick`)
-- Конфиг: `/etc/amnezia/amneziawg/awg0.conf`
-- Docker на машине, где будет запущен бот
+- **📋 Список ключей** — все пиры: имя, IP, статус 🟢/⚫, последний хэндшейк, трафик ↓↑
+- **➕ Новый ключ** — генерация ключей, QR-код + текст конфига с Amnezia-параметрами
+- **🗑 Отозвать ключ** — немедленное удаление из интерфейса и конфига
 
-## Деплой
+## Деплой на VDS
 
 ### 1. Создать бота и узнать свой Telegram ID
 
-1. Напишите [@BotFather](https://t.me/BotFather) → `/newbot` → получите `BOT_TOKEN`.
-2. Узнайте свой Telegram ID через [@userinfobot](https://t.me/userinfobot).
+1. Напишите [@BotFather](https://t.me/BotFather) → `/newbot` → получите `BOT_TOKEN`
+2. Узнайте свой Telegram ID через [@userinfobot](https://t.me/userinfobot)
 
-### 2. Сгенерировать SSH-ключ
-
-```bash
-ssh-keygen -t ed25519 -f ~/.ssh/vpnbot_ed25519 -N ""
-```
-
-Добавьте публичный ключ на VDS:
+### 2. На VDS — склонировать репо и настроить .env
 
 ```bash
-ssh-copy-id -i ~/.ssh/vpnbot_ed25519.pub root@<VPN_HOST>
-# или вручную:
-cat ~/.ssh/vpnbot_ed25519.pub >> ~/.ssh/authorized_keys
-```
-
-### 3. Настроить sudo без пароля на VDS
-
-Создайте файл `/etc/sudoers.d/vpnbot`:
-
-```
-root ALL=(ALL) NOPASSWD: /usr/bin/awg, /usr/sbin/awg, /usr/bin/tee, /bin/tee, /usr/bin/cat, /bin/cat
-```
-
-> Замените `root` на фактического SSH-пользователя, если используете не root.
-
-### 4. Настроить .env
-
-Скопируйте `.env.example` в `.env` и заполните значения:
-
-```bash
+git clone https://github.com/GlenKoks/amnezia_vpn_bot.git
+cd amnezia_vpn_bot
 cp .env.example .env
+nano .env
 ```
+
+Заполните `.env`:
 
 ```env
 BOT_TOKEN=1234567890:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ADMIN_TELEGRAM_ID=123456789
 VPN_HOST=1.2.3.4
-VPN_SSH_PORT=22
-VPN_SSH_USER=root
-VPN_SSH_KEY_PATH=/app/id_ed25519
 VPN_INTERFACE=awg0
+VPN_DOCKER_CONTAINER=amnezia-awg2
 ```
 
-### 5. Собрать и запустить
+### 3. Собрать и запустить
 
 ```bash
 docker build -t amnezia-vpn-bot .
@@ -66,24 +43,24 @@ docker run -d \
   --name amnezia-vpn-bot \
   --restart unless-stopped \
   --env-file .env \
-  -v ~/.ssh/vpnbot_ed25519:/app/id_ed25519:ro \
+  -v /var/run/docker.sock:/var/run/docker.sock \
   amnezia-vpn-bot
 ```
 
-## Использование
+### 4. Проверить логи
 
-Напишите боту `/start` — появится главное меню:
+```bash
+docker logs -f amnezia-vpn-bot
+```
 
-- **📋 Список ключей** — все пиры: имя, IP, статус 🟢/⚫, время последнего хэндшейка, трафик ↓↑
-- **➕ Новый ключ** — бот попросит имя, создаст пир, вышлет QR-код и текст конфига
-- **🗑 Отозвать ключ** — выберите ключ из списка, подтвердите — ключ немедленно удаляется из живого интерфейса и конфига
+Должно быть `Starting bot...` — всё работает.
 
 ## Как это работает
 
-Бот подключается к VDS по SSH и выполняет команды:
+Бот подключается к Docker daemon через `/var/run/docker.sock` и выполняет команды внутри контейнера `amnezia-awg2`:
 
 - `awg genkey / pubkey / genpsk` — генерация ключей
-- `sudo awg addconf awg0 /dev/stdin` — добавление пира без перезапуска
-- `sudo awg set awg0 peer <pubkey> remove` — отзыв пира из живого интерфейса
-- `sudo awg show awg0 dump` — получение статистики
-- Запись конфига через `base64 | sudo tee` — безопасная запись без проблем с экранированием
+- `awg addconf awg0 /dev/stdin` — добавление пира без перезапуска
+- `awg set awg0 peer <pubkey> remove` — отзыв пира
+- `awg show awg0 dump` — статистика
+- Запись конфига через `base64` — безопасная запись без проблем с экранированием

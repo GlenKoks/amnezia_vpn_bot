@@ -1,4 +1,4 @@
 aiogram==3.13.1
-asyncssh==2.18.0
+docker==7.1.0
 qrcode[pil]==8.0
 python-dotenv==1.0.1

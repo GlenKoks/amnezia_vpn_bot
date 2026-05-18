@@ -110,6 +110,38 @@ def _log_key_issued(
         log.exception("Failed to write keys log")
 
 
+def _enrich_users_from_log(users: dict[str, dict]) -> dict[str, dict]:
+    """Fill missing name/username in users dict from keys_log entries."""
+    if not Path(KEYS_LOG_FILE).exists():
+        return users
+    try:
+        with open(KEYS_LOG_FILE) as f:
+            log_entries = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return users
+    # Build map uid_str -> (name, username) from log
+    log_info: dict[str, tuple[str, str]] = {}
+    for entry in log_entries:
+        uid_str = str(entry.get("issued_by_id", ""))
+        if uid_str and uid_str not in log_info:
+            n = entry.get("issued_by_name", "—") or "—"
+            u = entry.get("issued_by_username", "") or ""
+            log_info[uid_str] = (n, u)
+    changed = False
+    for uid_str, info in users.items():
+        if uid_str in log_info:
+            n, u = log_info[uid_str]
+            if info.get("name", "—") in ("—", "", None):
+                info["name"] = n
+                changed = True
+            if info.get("username", "") in ("нет", "", None):
+                info["username"] = u
+                changed = True
+    if changed:
+        _save_users(users)
+    return users
+
+
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 def is_admin(user_id: int) -> bool:
@@ -284,7 +316,7 @@ async def msg_users_list(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
         return
     await state.clear()
-    users = _load_users()
+    users = _enrich_users_from_log(_load_users())
     if not users:
         await message.answer("Пользователей с доступом нет.")
         return
@@ -453,7 +485,7 @@ async def cb_users_list(call: CallbackQuery) -> None:
         return
     await call.answer()
 
-    users = _load_users()
+    users = _enrich_users_from_log(_load_users())
     if not users:
         await call.message.edit_text("Пользователей с доступом нет.")
         return
@@ -497,25 +529,25 @@ async def cb_user_detail(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
 
     uid_str = call.data.split(":", 1)[1]
-    users = _load_users()
+    users = _enrich_users_from_log(_load_users())
     info = users.get(uid_str, {})
     name = info.get("name", "—")
-    username = info.get("username", "нет")
+    username = info.get("username", "") or ""
 
-    # Collect this user's public keys from log
-    user_pubkeys: set[str] = set()
+    # Collect this user's log entries (key_name + pubkey)
+    user_log_entries: list[dict] = []
     if Path(KEYS_LOG_FILE).exists():
         try:
             with open(KEYS_LOG_FILE) as f:
                 for entry in json.load(f):
                     if str(entry.get("issued_by_id")) == uid_str:
-                        user_pubkeys.add(entry["public_key"])
+                        user_log_entries.append(entry)
         except (json.JSONDecodeError, OSError):
             pass
 
-    if not user_pubkeys:
+    if not user_log_entries:
         await call.message.edit_text(
-            f"👤 <b>{name}</b> {username}\n\nКлючей не выдавал.",
+            f"👤 <b>{name}</b> {username}\n\nКлючей не выдавалось.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="← Назад", callback_data="users_list"),
@@ -529,38 +561,42 @@ async def cb_user_detail(call: CallbackQuery, state: FSMContext) -> None:
         await call.message.edit_text(f"Ошибка: {e}")
         return
 
-    # Only active peers belonging to this user, sorted oldest handshake first
-    user_peers = sorted(
-        [p for p in peers if p.public_key in user_pubkeys],
-        key=lambda p: p.last_handshake,
-    )
+    active_peers = {p.public_key: p for p in peers}
 
-    if not user_peers:
-        await call.message.edit_text(
-            f"👤 <b>{name}</b> {username}\n\nВсе ключи отозваны.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="← Назад", callback_data="users_list"),
-            ]]),
-        )
-        return
+    # Sort: active peers (by handshake asc) first, then revoked
+    def sort_key(entry: dict) -> tuple:
+        p = active_peers.get(entry.get("public_key", ""))
+        if p:
+            return (0, p.last_handshake)
+        return (1, 0)
+
+    sorted_entries = sorted(user_log_entries, key=sort_key)
 
     lines = [f"👤 <b>{name}</b> {username}"]
     buttons = []
-    for p in user_peers:
-        status = "🟢" if p.is_online else "⚫"
-        lines.append(
-            f"\n{status} <b>{p.name}</b> ({p.allowed_ip})\n"
-            f"Хэндшейк: {p.handshake_str} · {p.traffic_str}"
-        )
-        buttons.append([InlineKeyboardButton(
-            text=f"🗑 Отозвать {p.name}",
-            callback_data=f"revoke_select:{p.public_key}",
-        )])
+    has_active = False
+    for entry in sorted_entries:
+        pubkey = entry.get("public_key", "")
+        key_name = entry.get("key_name", pubkey[:12])
+        peer = active_peers.get(pubkey)
+        if peer:
+            has_active = True
+            status = "🟢" if peer.is_online else "⚫"
+            lines.append(
+                f"\n{status} <b>{peer.name}</b> ({peer.allowed_ip})\n"
+                f"Хэндшейк: {peer.handshake_str} · {peer.traffic_str}"
+            )
+            buttons.append([InlineKeyboardButton(
+                text=f"🗑 Отозвать {peer.name}",
+                callback_data=f"revoke_select:{pubkey}",
+            )])
+        else:
+            lines.append(f"\n🚫 <b>{key_name}</b> — отозван")
 
     buttons.append([InlineKeyboardButton(text="← Назад", callback_data="users_list")])
-    await state.update_data(back_to=f"user_detail:{uid_str}")
-    await state.set_state(RevokePeerForm.waiting_choice)
+    if has_active:
+        await state.update_data(back_to=f"user_detail:{uid_str}")
+        await state.set_state(RevokePeerForm.waiting_choice)
 
     await call.message.edit_text(
         "\n".join(lines),

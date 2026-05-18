@@ -251,9 +251,19 @@ async def cb_back_main(call: CallbackQuery, state: FSMContext) -> None:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+@dp.message()
+async def catch_all(message: Message) -> None:
+    log.info("Received message from %s (id=%s): %s", message.from_user.username, message.from_user.id, message.text)
+
+
+@dp.errors()
+async def error_handler(event, exception: Exception) -> None:
+    log.exception("Unhandled error: %s", exception)
+
+
 async def main() -> None:
     log.info("Starting bot...")
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":

@@ -37,29 +37,42 @@ vpn = VPNManager()
 
 
 # ── User store ────────────────────────────────────────────────────────────────
+# Format: {str(user_id): {name, username, approved_at}}
 
-def _load_users() -> set[int]:
+_pending: dict[int, dict] = {}  # user_id -> {name, username} for pending requests
+
+
+def _load_users() -> dict[str, dict]:
     try:
         with open(USERS_FILE) as f:
-            return set(json.load(f))
+            data = json.load(f)
+        # migrate old list format
+        if isinstance(data, list):
+            data = {str(uid): {"name": "—", "username": "нет", "approved_at": "—"} for uid in data}
+        return data
     except (FileNotFoundError, json.JSONDecodeError):
-        return set()
+        return {}
 
 
-def _save_users(users: set[int]) -> None:
+def _save_users(users: dict[str, dict]) -> None:
     Path(USERS_FILE).parent.mkdir(parents=True, exist_ok=True)
     with open(USERS_FILE, "w") as f:
-        json.dump(list(users), f)
+        json.dump(users, f, ensure_ascii=False, indent=2)
 
 
-def add_shared_user(user_id: int) -> None:
+def add_shared_user(user_id: int, name: str = "—", username: str = "нет") -> None:
+    from datetime import datetime
     users = _load_users()
-    users.add(user_id)
+    users[str(user_id)] = {
+        "name": name,
+        "username": username,
+        "approved_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+    }
     _save_users(users)
 
 
 def is_shared(user_id: int) -> bool:
-    return user_id in _load_users()
+    return str(user_id) in _load_users()
 
 
 # ── Keys log ──────────────────────────────────────────────────────────────────
@@ -128,6 +141,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="➕ Новый ключ", callback_data="add_peer")],
         [InlineKeyboardButton(text="🗑 Отозвать ключ", callback_data="revoke_peer")],
         [InlineKeyboardButton(text="📜 Лог ключей", callback_data="keys_log")],
+        [InlineKeyboardButton(text="👥 Пользователи", callback_data="users_list")],
     ])
 
 
@@ -165,6 +179,7 @@ async def cmd_start(message: Message) -> None:
     parts = [user.first_name or "", user.last_name or ""]
     full_name = " ".join(p for p in parts if p) or "—"
     username = f"@{user.username}" if user.username else "нет"
+    _pending[uid] = {"name": full_name, "username": username}
 
     await bot.send_message(
         ADMIN_ID,
@@ -187,7 +202,8 @@ async def cb_approve_user(call: CallbackQuery) -> None:
         await call.answer("Нет доступа.", show_alert=True)
         return
     user_id = int(call.data.split(":", 1)[1])
-    add_shared_user(user_id)
+    info = _pending.pop(user_id, {})
+    add_shared_user(user_id, info.get("name", "—"), info.get("username", "нет"))
     await call.answer("Доступ выдан.")
     await call.message.edit_text(
         call.message.text + "\n\n✅ Доступ выдан",
@@ -305,6 +321,56 @@ async def fsm_add_peer_name(message: Message, state: FSMContext) -> None:
         parse_mode="HTML",
         reply_markup=_menu_for(message.from_user.id),
     )
+
+
+# ── Users list ───────────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "users_list")
+async def cb_users_list(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    await call.answer()
+
+    users = _load_users()
+    if not users:
+        await call.message.answer("Пользователей с доступом нет.", reply_markup=main_menu_kb())
+        return
+
+    # Build keys-per-user map from log
+    keys_by_user: dict[str, list[dict]] = {}
+    if Path(KEYS_LOG_FILE).exists():
+        try:
+            with open(KEYS_LOG_FILE) as f:
+                for entry in json.load(f):
+                    uid_str = str(entry.get("issued_by_id", ""))
+                    keys_by_user.setdefault(uid_str, []).append(entry)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    lines = [f"<b>👥 Пользователи с доступом: {len(users)}</b>\n"]
+    for uid_str, info in users.items():
+        name = info.get("name", "—")
+        username = info.get("username", "нет")
+        approved_at = info.get("approved_at", "—")
+        lines.append(f"👤 <b>{name}</b> {username} (<code>{uid_str}</code>)\n   Одобрен: {approved_at}")
+
+        user_keys = keys_by_user.get(uid_str, [])
+        if user_keys:
+            for k in user_keys:
+                lines.append(f"   🔑 {k['key_name']} → {k['allowed_ip']}  <i>{k['timestamp']}</i>")
+        else:
+            lines.append("   Ключей не выдавал")
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        await call.message.answer_document(
+            BufferedInputFile(text.encode(), filename="users.txt"),
+            caption="👥 Список пользователей",
+            reply_markup=main_menu_kb(),
+        )
+    else:
+        await call.message.answer(text, parse_mode="HTML", reply_markup=main_menu_kb())
 
 
 # ── Keys log ─────────────────────────────────────────────────────────────────

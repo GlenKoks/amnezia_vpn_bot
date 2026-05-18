@@ -671,6 +671,27 @@ async def cb_revoke_confirm(call: CallbackQuery, state: FSMContext) -> None:
         await call.message.edit_text(f"Ошибка: {e}")
         return
 
+    # Notify the key owner if they're not the admin
+    owner_id: int | None = None
+    if Path(KEYS_LOG_FILE).exists():
+        try:
+            with open(KEYS_LOG_FILE) as f:
+                for entry in json.load(f):
+                    if entry.get("public_key") == pub_key:
+                        owner_id = entry.get("issued_by_id")
+                        break
+        except (json.JSONDecodeError, OSError):
+            pass
+    if owner_id and not is_admin(owner_id):
+        try:
+            await bot.send_message(
+                owner_id,
+                f"🚫 Ваш ключ <b>{name}</b> был отозван администратором.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            log.exception("Failed to notify key owner about revocation")
+
     if back_to and back_to.startswith("user_detail:"):
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="← К пользователю", callback_data=back_to),

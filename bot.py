@@ -111,7 +111,8 @@ def _log_key_issued(
 
 
 def _enrich_users_from_log(users: dict[str, dict]) -> dict[str, dict]:
-    """Fill missing name/username in users dict from keys_log entries."""
+    """Fill missing name/username in users dict from keys_log entries.
+    Also injects admin as a virtual entry if they have issued keys."""
     if not Path(KEYS_LOG_FILE).exists():
         return users
     try:
@@ -127,6 +128,12 @@ def _enrich_users_from_log(users: dict[str, dict]) -> dict[str, dict]:
             n = entry.get("issued_by_name", "—") or "—"
             u = entry.get("issued_by_username", "") or ""
             log_info[uid_str] = (n, u)
+    # Inject admin as virtual entry if they have keys but aren't in users.json
+    admin_str = str(ADMIN_ID)
+    if admin_str not in users and admin_str in log_info:
+        n, u = log_info[admin_str]
+        users = dict(users)  # copy to avoid mutating caller's dict
+        users[admin_str] = {"name": n, "username": u, "approved_at": "admin"}
     changed = False
     for uid_str, info in users.items():
         if uid_str in log_info:
@@ -138,7 +145,8 @@ def _enrich_users_from_log(users: dict[str, dict]) -> dict[str, dict]:
                 info["username"] = u
                 changed = True
     if changed:
-        _save_users(users)
+        non_admin = {k: v for k, v in users.items() if k != admin_str or v.get("approved_at") != "admin"}
+        _save_users(non_admin)
     return users
 
 

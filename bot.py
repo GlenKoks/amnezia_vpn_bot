@@ -176,7 +176,7 @@ async def cb_revoke_peer(call: CallbackQuery, state: FSMContext) -> None:
 
     buttons = [
         [InlineKeyboardButton(
-            text=f"{'🟢' if p.is_online else '⚫'} {p.name} ({p.allowed_ip})",
+            text=f"{'🟢' if p.is_online else '⚫'} {p.name} ({p.allowed_ip}) · {p.handshake_str}",
             callback_data=f"revoke_select:{p.public_key}",
         )]
         for p in peers

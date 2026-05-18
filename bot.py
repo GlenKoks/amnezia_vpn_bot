@@ -691,7 +691,7 @@ async def cb_revoke_confirm(call: CallbackQuery, state: FSMContext) -> None:
             )
             await bot.send_sticker(
                 owner_id,
-                sticker="AAMCAgADGQEAAUn1T2oLAkfY7kP1AmO17Z6RPlQ8reBqAAKSZAACmAw4SebAkkZJD2F3AQAHbQADOwQ",
+                sticker="CAACAgIAAxkBAAFJ9U9qCwJH2O5D9QJjte2ekT5UPK3gagACkmQAApgMOEnmwJJGSQ9hdzsE",
             )
         except Exception:
             log.exception("Failed to notify key owner about revocation")
@@ -705,13 +705,6 @@ async def cb_revoke_confirm(call: CallbackQuery, state: FSMContext) -> None:
     await call.message.edit_text(
         f"Ключ <b>{name}</b> отозван.", parse_mode="HTML", reply_markup=kb
     )
-
-
-@dp.message(F.sticker)
-async def get_sticker_id(message: Message) -> None:
-    if not is_admin(message.from_user.id):
-        return
-    await message.reply(f"<code>{message.sticker.file_id}</code>", parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "back_main")

@@ -15,7 +15,9 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 from dotenv import load_dotenv
 
@@ -108,6 +110,46 @@ def _log_key_issued(
         log.exception("Failed to write keys log")
 
 
+def _enrich_users_from_log(users: dict[str, dict]) -> dict[str, dict]:
+    """Fill missing name/username in users dict from keys_log entries.
+    Also injects admin as a virtual entry if they have issued keys."""
+    if not Path(KEYS_LOG_FILE).exists():
+        return users
+    try:
+        with open(KEYS_LOG_FILE) as f:
+            log_entries = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return users
+    # Build map uid_str -> (name, username) from log
+    log_info: dict[str, tuple[str, str]] = {}
+    for entry in log_entries:
+        uid_str = str(entry.get("issued_by_id", ""))
+        if uid_str and uid_str not in log_info:
+            n = entry.get("issued_by_name", "—") or "—"
+            u = entry.get("issued_by_username", "") or ""
+            log_info[uid_str] = (n, u)
+    # Inject admin as virtual entry if they have keys but aren't in users.json
+    admin_str = str(ADMIN_ID)
+    if admin_str not in users and admin_str in log_info:
+        n, u = log_info[admin_str]
+        users = dict(users)  # copy to avoid mutating caller's dict
+        users[admin_str] = {"name": n, "username": u, "approved_at": "admin"}
+    changed = False
+    for uid_str, info in users.items():
+        if uid_str in log_info:
+            n, u = log_info[uid_str]
+            if info.get("name", "—") in ("—", "", None):
+                info["name"] = n
+                changed = True
+            if info.get("username", "") in ("нет", "", None):
+                info["username"] = u
+                changed = True
+    if changed:
+        non_admin = {k: v for k, v in users.items() if k != admin_str or v.get("approved_at") != "admin"}
+        _save_users(non_admin)
+    return users
+
+
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 def is_admin(user_id: int) -> bool:
@@ -135,23 +177,25 @@ class RevokePeerForm(StatesGroup):
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 
-def main_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Список ключей", callback_data="list_peers")],
-        [InlineKeyboardButton(text="➕ Новый ключ", callback_data="add_peer")],
-        [InlineKeyboardButton(text="🗑 Отозвать ключ", callback_data="revoke_peer")],
-        [InlineKeyboardButton(text="📜 Лог ключей", callback_data="keys_log")],
-        [InlineKeyboardButton(text="👥 Пользователи", callback_data="users_list")],
-    ])
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📋 Список ключей"), KeyboardButton(text="➕ Новый ключ")],
+            [KeyboardButton(text="🗑 Отозвать ключ"), KeyboardButton(text="📜 Лог ключей")],
+            [KeyboardButton(text="👥 Пользователи")],
+        ],
+        resize_keyboard=True,
+    )
 
 
-def limited_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Новый ключ", callback_data="add_peer")],
-    ])
+def limited_menu_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="➕ Новый ключ")]],
+        resize_keyboard=True,
+    )
 
 
-def _menu_for(user_id: int) -> InlineKeyboardMarkup:
+def _menu_for(user_id: int) -> ReplyKeyboardMarkup:
     return main_menu_kb() if is_admin(user_id) else limited_menu_kb()
 
 
@@ -192,6 +236,173 @@ async def cmd_start(message: Message) -> None:
     )
     await message.answer("Запрос отправлен администратору. Ожидайте решения.")
     log.info("Access request from %s (%s, id=%s)", full_name, username, uid)
+
+
+# ── Reply keyboard handlers (registered before FSM to take priority) ─────────
+
+def _key_created_dates() -> dict[str, str]:
+    """Return {public_key: formatted_date} from keys_log."""
+    if not Path(KEYS_LOG_FILE).exists():
+        return {}
+    try:
+        with open(KEYS_LOG_FILE) as f:
+            entries = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    result = {}
+    for entry in entries:
+        pk = entry.get("public_key", "")
+        ts = entry.get("timestamp", "")
+        if pk and ts and pk not in result:
+            # timestamp format: "2026-05-18 12:00:00 UTC" → "18.05.2026"
+            try:
+                date_part = ts.split(" ")[0]
+                y, m, d = date_part.split("-")
+                result[pk] = f"{d}.{m}.{y}"
+            except Exception:
+                result[pk] = ts[:10]
+    return result
+
+
+@dp.message(F.text == "📋 Список ключей")
+async def msg_list_peers(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    await message.answer("⏳ Загружаю список...")
+    try:
+        peers = await vpn.list_peers()
+    except Exception as e:
+        log.exception("list_peers failed")
+        await message.answer(f"Ошибка: {e}")
+        return
+    if not peers:
+        await message.answer("Пиров нет.")
+        return
+    created = _key_created_dates()
+    lines = []
+    for p in peers:
+        status = "🟢" if p.is_online else "⚫"
+        date_str = created.get(p.public_key)
+        created_line = f"   Создан: {date_str}\n" if date_str else ""
+        lines.append(
+            f"{status} <b>{p.name}</b> ({p.allowed_ip})\n"
+            f"{created_line}"
+            f"   Хэндшейк: {p.handshake_str}  {p.traffic_str}"
+        )
+    await message.answer("\n\n".join(lines), parse_mode="HTML")
+
+
+@dp.message(F.text == "➕ Новый ключ")
+async def msg_add_peer(message: Message, state: FSMContext) -> None:
+    if not can_generate(message.from_user.id):
+        return
+    await state.clear()
+    await message.answer("Введите имя нового ключа (например: Иван iPhone):")
+    await state.set_state(AddPeerForm.waiting_name)
+
+
+@dp.message(F.text == "🗑 Отозвать ключ")
+async def msg_revoke_peer(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    await message.answer("⏳ Загружаю список пиров…")
+    try:
+        peers = await vpn.list_peers()
+    except Exception as e:
+        log.exception("list_peers for revoke failed")
+        await message.answer(f"Ошибка: {e}")
+        return
+    if not peers:
+        await message.answer("Нет активных ключей.")
+        return
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"{'🟢' if p.is_online else '⚫'} {p.name} ({p.allowed_ip}) · {p.handshake_str}",
+            callback_data=f"revoke_select:{p.public_key}",
+        )]
+        for p in peers
+    ]
+    await message.answer(
+        "Выберите ключ для отзыва:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await state.set_state(RevokePeerForm.waiting_choice)
+
+
+@dp.message(F.text == "📜 Лог ключей")
+async def msg_keys_log(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    if not Path(KEYS_LOG_FILE).exists():
+        await message.answer("Лог пустой — ключи ещё не выдавались.")
+        return
+    with open(KEYS_LOG_FILE, "rb") as f:
+        data = f.read()
+    await message.answer_document(
+        BufferedInputFile(data, filename="keys_log.json"),
+        caption="📜 Полный лог выданных ключей",
+    )
+
+
+async def _users_list_keyboard() -> tuple[str, InlineKeyboardMarkup] | tuple[str, None]:
+    """Return (text, keyboard) for the users list built from active VPN peers."""
+    try:
+        peers = await vpn.list_peers()
+    except Exception as e:
+        return f"Ошибка получения пиров: {e}", None
+
+    active_pubkeys = {p.public_key for p in peers}
+
+    # Load log entries for active peers only, group by issuer
+    issuers: dict[str, dict] = {}  # uid_str -> {name, username, count}
+    if Path(KEYS_LOG_FILE).exists():
+        try:
+            with open(KEYS_LOG_FILE) as f:
+                for entry in json.load(f):
+                    if entry.get("public_key") not in active_pubkeys:
+                        continue
+                    uid_str = str(entry.get("issued_by_id", ""))
+                    if not uid_str:
+                        continue
+                    if uid_str not in issuers:
+                        issuers[uid_str] = {
+                            "name": entry.get("issued_by_name", "—") or "—",
+                            "username": entry.get("issued_by_username", "") or "",
+                            "count": 0,
+                        }
+                    issuers[uid_str]["count"] += 1
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    if not issuers:
+        return "Активных ключей нет.", None
+
+    buttons = []
+    for uid_str, info in issuers.items():
+        name = info["name"]
+        username = info["username"]
+        count = info["count"]
+        label = "1 ключ" if count == 1 else f"{count} ключей"
+        display = f"{name} {username}".strip() if username else name
+        buttons.append([InlineKeyboardButton(
+            text=f"👤 {display} — {label}",
+            callback_data=f"user_detail:{uid_str}",
+        )])
+
+    text = f"<b>👥 Пользователи с активными ключами: {len(issuers)}</b>"
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@dp.message(F.text == "👥 Пользователи")
+async def msg_users_list(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    text, kb = await _users_list_keyboard()
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
 # ── Access approve / deny ─────────────────────────────────────────────────────
@@ -247,21 +458,25 @@ async def cb_list_peers(call: CallbackQuery) -> None:
         peers = await vpn.list_peers()
     except Exception as e:
         log.exception("list_peers failed")
-        await call.message.edit_text(f"Ошибка: {e}", reply_markup=main_menu_kb())
+        await call.message.edit_text(f"Ошибка: {e}")
         return
 
     if not peers:
-        await call.message.edit_text("Пиров нет.", reply_markup=main_menu_kb())
+        await call.message.edit_text("Пиров нет.")
         return
 
+    created = _key_created_dates()
     lines = []
     for p in peers:
         status = "🟢" if p.is_online else "⚫"
+        date_str = created.get(p.public_key)
+        created_line = f"   Создан: {date_str}\n" if date_str else ""
         lines.append(
             f"{status} <b>{p.name}</b> ({p.allowed_ip})\n"
+            f"{created_line}"
             f"   Хэндшейк: {p.handshake_str}  {p.traffic_str}"
         )
-    await call.message.edit_text("\n\n".join(lines), parse_mode="HTML", reply_markup=main_menu_kb())
+    await call.message.edit_text("\n\n".join(lines), parse_mode="HTML")
 
 
 # ── Add peer ──────────────────────────────────────────────────────────────────
@@ -305,6 +520,17 @@ async def fsm_add_peer_name(message: Message, state: FSMContext) -> None:
     issuer_username = f"@{user.username}" if user.username else "нет"
     _log_key_issued(name, pub_key, allowed_ip, user.id, issuer_name, issuer_username)
 
+    if not is_admin(user.id):
+        user_display = issuer_username if issuer_username != "нет" else issuer_name
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"🔑 <b>{user_display}</b> ({issuer_name}) получил новый ключ: <b>{name}</b>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            log.exception("Failed to notify admin about new key")
+
     qr = qrcode.make(client_config)
     buf = io.BytesIO()
     qr.save(buf, format="PNG")
@@ -332,40 +558,14 @@ async def cb_users_list(call: CallbackQuery) -> None:
         return
     await call.answer()
 
-    users = _load_users()
-    if not users:
-        await call.message.edit_text("Пользователей с доступом нет.", reply_markup=main_menu_kb())
+    text, kb = await _users_list_keyboard()
+    if kb is None:
+        await call.message.edit_text(text, parse_mode="HTML")
         return
 
-    # Count issued keys per user from log
-    keys_count: dict[str, int] = {}
-    if Path(KEYS_LOG_FILE).exists():
-        try:
-            with open(KEYS_LOG_FILE) as f:
-                for entry in json.load(f):
-                    uid_str = str(entry.get("issued_by_id", ""))
-                    keys_count[uid_str] = keys_count.get(uid_str, 0) + 1
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    buttons = []
-    for uid_str, info in users.items():
-        name = info.get("name", "—")
-        username = info.get("username", "")
-        count = keys_count.get(uid_str, 0)
-        label = f"1 ключ" if count == 1 else f"{count} ключей"
-        display = f"{name} {username}".strip() if username else name
-        buttons.append([InlineKeyboardButton(
-            text=f"👤 {display} — {label}",
-            callback_data=f"user_detail:{uid_str}",
-        )])
-    buttons.append([InlineKeyboardButton(text="← Назад", callback_data="back_main")])
-
-    await call.message.edit_text(
-        f"<b>👥 Пользователи с доступом: {len(users)}</b>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-    )
+    # Add back button
+    kb.inline_keyboard.append([InlineKeyboardButton(text="← Назад", callback_data="back_main")])
+    await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
 
 @dp.callback_query(F.data.startswith("user_detail:"))
@@ -376,25 +576,25 @@ async def cb_user_detail(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
 
     uid_str = call.data.split(":", 1)[1]
-    users = _load_users()
+    users = _enrich_users_from_log(_load_users())
     info = users.get(uid_str, {})
     name = info.get("name", "—")
-    username = info.get("username", "нет")
+    username = info.get("username", "") or ""
 
-    # Collect this user's public keys from log
-    user_pubkeys: set[str] = set()
+    # Collect this user's log entries (key_name + pubkey)
+    user_log_entries: list[dict] = []
     if Path(KEYS_LOG_FILE).exists():
         try:
             with open(KEYS_LOG_FILE) as f:
                 for entry in json.load(f):
                     if str(entry.get("issued_by_id")) == uid_str:
-                        user_pubkeys.add(entry["public_key"])
+                        user_log_entries.append(entry)
         except (json.JSONDecodeError, OSError):
             pass
 
-    if not user_pubkeys:
+    if not user_log_entries:
         await call.message.edit_text(
-            f"👤 <b>{name}</b> {username}\n\nКлючей не выдавал.",
+            f"👤 <b>{name}</b> {username}\n\nКлючей не выдавалось.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="← Назад", callback_data="users_list"),
@@ -405,18 +605,20 @@ async def cb_user_detail(call: CallbackQuery, state: FSMContext) -> None:
     try:
         peers = await vpn.list_peers()
     except Exception as e:
-        await call.message.edit_text(f"Ошибка: {e}", reply_markup=main_menu_kb())
+        await call.message.edit_text(f"Ошибка: {e}")
         return
 
-    # Only active peers belonging to this user, sorted oldest handshake first
-    user_peers = sorted(
-        [p for p in peers if p.public_key in user_pubkeys],
-        key=lambda p: p.last_handshake,
+    active_peers = {p.public_key: p for p in peers}
+
+    # Only active peers from this user's log, sorted by handshake asc
+    active_entries = sorted(
+        [e for e in user_log_entries if e.get("public_key", "") in active_peers],
+        key=lambda e: active_peers[e["public_key"]].last_handshake,
     )
 
-    if not user_peers:
+    if not active_entries:
         await call.message.edit_text(
-            f"👤 <b>{name}</b> {username}\n\nВсе ключи отозваны.",
+            f"👤 <b>{name}</b> {username}\n\nАктивных ключей нет.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="← Назад", callback_data="users_list"),
@@ -426,15 +628,17 @@ async def cb_user_detail(call: CallbackQuery, state: FSMContext) -> None:
 
     lines = [f"👤 <b>{name}</b> {username}"]
     buttons = []
-    for p in user_peers:
-        status = "🟢" if p.is_online else "⚫"
+    for entry in active_entries:
+        pubkey = entry.get("public_key", "")
+        peer = active_peers[pubkey]
+        status = "🟢" if peer.is_online else "⚫"
         lines.append(
-            f"\n{status} <b>{p.name}</b> ({p.allowed_ip})\n"
-            f"Хэндшейк: {p.handshake_str} · {p.traffic_str}"
+            f"\n{status} <b>{peer.name}</b> ({peer.allowed_ip})\n"
+            f"Хэндшейк: {peer.handshake_str} · {peer.traffic_str}"
         )
         buttons.append([InlineKeyboardButton(
-            text=f"🗑 Отозвать {p.name}",
-            callback_data=f"revoke_select:{p.public_key}",
+            text=f"🗑 Отозвать {peer.name}",
+            callback_data=f"revoke_select:{pubkey}",
         )])
 
     buttons.append([InlineKeyboardButton(text="← Назад", callback_data="users_list")])
@@ -448,62 +652,7 @@ async def cb_user_detail(call: CallbackQuery, state: FSMContext) -> None:
     )
 
 
-# ── Keys log ─────────────────────────────────────────────────────────────────
-
-@dp.callback_query(F.data == "keys_log")
-async def cb_keys_log(call: CallbackQuery) -> None:
-    if not is_admin(call.from_user.id):
-        await call.answer("Нет доступа.", show_alert=True)
-        return
-    await call.answer()
-
-    if not Path(KEYS_LOG_FILE).exists():
-        await call.message.answer("Лог пустой — ключи ещё не выдавались.", reply_markup=main_menu_kb())
-        return
-
-    with open(KEYS_LOG_FILE, "rb") as f:
-        data = f.read()
-
-    await call.message.answer_document(
-        BufferedInputFile(data, filename="keys_log.json"),
-        caption="📜 Полный лог выданных ключей",
-        reply_markup=main_menu_kb(),
-    )
-
-
-# ── Revoke peer ───────────────────────────────────────────────────────────────
-
-@dp.callback_query(F.data == "revoke_peer")
-async def cb_revoke_peer(call: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin(call.from_user.id):
-        await call.answer("Нет доступа.", show_alert=True)
-        return
-    await call.answer()
-    await call.message.edit_text("⏳ Загружаю список пиров…")
-    try:
-        peers = await vpn.list_peers()
-    except Exception as e:
-        log.exception("list_peers for revoke failed")
-        await call.message.edit_text(f"Ошибка: {e}", reply_markup=main_menu_kb())
-        return
-
-    if not peers:
-        await call.message.edit_text("Нет активных ключей.", reply_markup=main_menu_kb())
-        return
-
-    buttons = [
-        [InlineKeyboardButton(
-            text=f"{'🟢' if p.is_online else '⚫'} {p.name} ({p.allowed_ip}) · {p.handshake_str}",
-            callback_data=f"revoke_select:{p.public_key}",
-        )]
-        for p in peers
-    ]
-    buttons.append([InlineKeyboardButton(text="← Назад", callback_data="back_main")])
-    await call.message.edit_text(
-        "Выберите ключ для отзыва:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-    )
-    await state.set_state(RevokePeerForm.waiting_choice)
+# ── Revoke peer (inline flow from callback) ───────────────────────────────────
 
 
 @dp.callback_query(F.data.startswith("revoke_select:"))
@@ -551,16 +700,40 @@ async def cb_revoke_confirm(call: CallbackQuery, state: FSMContext) -> None:
         await vpn.revoke_peer(pub_key)
     except Exception as e:
         log.exception("revoke_peer failed")
-        await call.message.edit_text(f"Ошибка: {e}", reply_markup=main_menu_kb())
+        await call.message.edit_text(f"Ошибка: {e}")
         return
+
+    # Notify the key owner if they're not the admin
+    owner_id: int | None = None
+    if Path(KEYS_LOG_FILE).exists():
+        try:
+            with open(KEYS_LOG_FILE) as f:
+                for entry in json.load(f):
+                    if entry.get("public_key") == pub_key:
+                        owner_id = entry.get("issued_by_id")
+                        break
+        except (json.JSONDecodeError, OSError):
+            pass
+    if owner_id and not is_admin(owner_id):
+        try:
+            await bot.send_message(
+                owner_id,
+                f"🚫 Ваш ключ <b>{name}</b> был отозван администратором.",
+                parse_mode="HTML",
+            )
+            await bot.send_sticker(
+                owner_id,
+                sticker="CAACAgIAAxkBAAFJ9U9qCwJH2O5D9QJjte2ekT5UPK3gagACkmQAApgMOEnmwJJGSQ9hdzsE",
+            )
+        except Exception:
+            log.exception("Failed to notify key owner about revocation")
 
     if back_to and back_to.startswith("user_detail:"):
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="← К пользователю", callback_data=back_to),
-            InlineKeyboardButton(text="🏠 Меню", callback_data="back_main"),
         ]])
     else:
-        kb = main_menu_kb()
+        kb = None
     await call.message.edit_text(
         f"Ключ <b>{name}</b> отозван.", parse_mode="HTML", reply_markup=kb
     )
@@ -570,7 +743,7 @@ async def cb_revoke_confirm(call: CallbackQuery, state: FSMContext) -> None:
 async def cb_back_main(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await call.answer()
-    await call.message.edit_text("VPN управление:", reply_markup=_menu_for(call.from_user.id))
+    await call.message.edit_reply_markup(reply_markup=None)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

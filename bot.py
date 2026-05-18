@@ -26,6 +26,7 @@ load_dotenv()
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_TELEGRAM_ID"])
 USERS_FILE = os.getenv("USERS_FILE", "/app/data/users.json")
+KEYS_LOG_FILE = os.getenv("KEYS_LOG_FILE", "/app/data/keys_log.json")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -59,6 +60,39 @@ def add_shared_user(user_id: int) -> None:
 
 def is_shared(user_id: int) -> bool:
     return user_id in _load_users()
+
+
+# ── Keys log ──────────────────────────────────────────────────────────────────
+
+def _log_key_issued(
+    key_name: str,
+    public_key: str,
+    allowed_ip: str,
+    issuer_id: int,
+    issuer_name: str,
+    issuer_username: str,
+) -> None:
+    from datetime import datetime
+    try:
+        try:
+            with open(KEYS_LOG_FILE) as f:
+                records = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            records = []
+        records.append({
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "key_name": key_name,
+            "public_key": public_key,
+            "allowed_ip": allowed_ip,
+            "issued_by_id": issuer_id,
+            "issued_by_name": issuer_name,
+            "issued_by_username": issuer_username,
+        })
+        Path(KEYS_LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
+        with open(KEYS_LOG_FILE, "w") as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+    except Exception:
+        log.exception("Failed to write keys log")
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -243,6 +277,16 @@ async def fsm_add_peer_name(message: Message, state: FSMContext) -> None:
         log.exception("add_peer failed")
         await status_msg.edit_text(f"Ошибка: {e}", reply_markup=_menu_for(message.from_user.id))
         return
+
+    # Extract assigned IP from config (Address = X.X.X.X/32)
+    import re as _re
+    ip_match = _re.search(r"Address\s*=\s*([\d.]+)", client_config)
+    allowed_ip = ip_match.group(1) if ip_match else "?"
+
+    user = message.from_user
+    issuer_name = " ".join(p for p in [user.first_name or "", user.last_name or ""] if p) or "—"
+    issuer_username = f"@{user.username}" if user.username else "нет"
+    _log_key_issued(name, pub_key, allowed_ip, user.id, issuer_name, issuer_username)
 
     qr = qrcode.make(client_config)
     buf = io.BytesIO()

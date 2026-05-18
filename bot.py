@@ -57,12 +57,6 @@ def add_shared_user(user_id: int) -> None:
     _save_users(users)
 
 
-def remove_shared_user(user_id: int) -> None:
-    users = _load_users()
-    users.discard(user_id)
-    _save_users(users)
-
-
 def is_shared(user_id: int) -> bool:
     return user_id in _load_users()
 
@@ -92,10 +86,6 @@ class RevokePeerForm(StatesGroup):
     waiting_confirm = State()
 
 
-class ShareForm(StatesGroup):
-    waiting_user_id = State()
-
-
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 
 def main_menu_kb() -> InlineKeyboardMarkup:
@@ -107,7 +97,6 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 
 
 def limited_menu_kb() -> InlineKeyboardMarkup:
-    """Menu for shared users — generate keys only."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Новый ключ", callback_data="add_peer")],
     ])
@@ -117,6 +106,13 @@ def _menu_for(user_id: int) -> InlineKeyboardMarkup:
     return main_menu_kb() if is_admin(user_id) else limited_menu_kb()
 
 
+def _access_request_kb(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Разрешить", callback_data=f"approve_user:{user_id}"),
+        InlineKeyboardButton(text="❌ Запретить", callback_data=f"deny_user:{user_id}"),
+    ]])
+
+
 # ── /start ────────────────────────────────────────────────────────────────────
 
 @dp.message(Command("start"))
@@ -124,49 +120,67 @@ async def cmd_start(message: Message) -> None:
     uid = message.from_user.id
     if is_admin(uid):
         await message.answer("VPN управление:", reply_markup=main_menu_kb())
-    elif is_shared(uid):
+        return
+    if is_shared(uid):
         await message.answer("VPN управление:", reply_markup=limited_menu_kb())
-    else:
-        await deny(message)
-
-
-# ── /share ────────────────────────────────────────────────────────────────────
-
-@dp.message(Command("share"))
-async def cmd_share(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
-        await deny(message)
         return
-    await message.answer(
-        "Введите Telegram ID пользователя, которому хотите дать доступ к генерации ключей.\n\n"
-        "Пользователь может узнать свой ID через @userinfobot"
-    )
-    await state.set_state(ShareForm.waiting_user_id)
 
+    # Unknown user — notify admin
+    user = message.from_user
+    parts = [user.first_name or "", user.last_name or ""]
+    full_name = " ".join(p for p in parts if p) or "—"
+    username = f"@{user.username}" if user.username else "нет"
 
-@dp.message(ShareForm.waiting_user_id)
-async def fsm_share_user_id(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
-        await deny(message)
-        return
-    try:
-        user_id = int(message.text.strip())
-    except ValueError:
-        await message.answer("Некорректный ID — введите число:")
-        return
-    if user_id == ADMIN_ID:
-        await message.answer("Это ваш собственный ID.", reply_markup=main_menu_kb())
-        await state.clear()
-        return
-    add_shared_user(user_id)
-    await state.clear()
-    await message.answer(
-        f"✅ Пользователь <code>{user_id}</code> получил доступ к генерации ключей.\n"
-        f"Пусть напишет боту /start",
+    await bot.send_message(
+        ADMIN_ID,
+        f"🔔 <b>Запрос доступа</b>\n\n"
+        f"Имя: <b>{full_name}</b>\n"
+        f"Username: {username}\n"
+        f"ID: <code>{uid}</code>",
         parse_mode="HTML",
-        reply_markup=main_menu_kb(),
+        reply_markup=_access_request_kb(uid),
     )
-    log.info("Admin granted access to user %s", user_id)
+    await message.answer("Запрос отправлен администратору. Ожидайте решения.")
+    log.info("Access request from %s (%s, id=%s)", full_name, username, uid)
+
+
+# ── Access approve / deny ─────────────────────────────────────────────────────
+
+@dp.callback_query(F.data.startswith("approve_user:"))
+async def cb_approve_user(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    user_id = int(call.data.split(":", 1)[1])
+    add_shared_user(user_id)
+    await call.answer("Доступ выдан.")
+    await call.message.edit_text(
+        call.message.text + "\n\n✅ Доступ выдан",
+        parse_mode="HTML",
+    )
+    try:
+        await bot.send_message(user_id, "✅ Доступ одобрен! Нажмите /start")
+    except Exception:
+        pass
+    log.info("Admin approved access for user %s", user_id)
+
+
+@dp.callback_query(F.data.startswith("deny_user:"))
+async def cb_deny_user(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    user_id = int(call.data.split(":", 1)[1])
+    await call.answer("Запрос отклонён.")
+    await call.message.edit_text(
+        call.message.text + "\n\n❌ Доступ запрещён",
+        parse_mode="HTML",
+    )
+    try:
+        await bot.send_message(user_id, "❌ В доступе отказано.")
+    except Exception:
+        pass
+    log.info("Admin denied access for user %s", user_id)
 
 
 # ── List peers ────────────────────────────────────────────────────────────────
@@ -276,8 +290,10 @@ async def cb_revoke_peer(call: CallbackQuery, state: FSMContext) -> None:
         for p in peers
     ]
     buttons.append([InlineKeyboardButton(text="← Назад", callback_data="back_main")])
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await call.message.edit_text("Выберите ключ для отзыва:", reply_markup=kb)
+    await call.message.edit_text(
+        "Выберите ключ для отзыва:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
     await state.set_state(RevokePeerForm.waiting_choice)
 
 
@@ -297,12 +313,10 @@ async def cb_revoke_select(call: CallbackQuery, state: FSMContext) -> None:
     name = peer.name if peer else pub_key[:16] + "…"
 
     await state.update_data(pub_key=pub_key, name=name)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Да, отозвать", callback_data="revoke_confirm"),
-            InlineKeyboardButton(text="❌ Отмена", callback_data="back_main"),
-        ]
-    ])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да, отозвать", callback_data="revoke_confirm"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="back_main"),
+    ]])
     await call.message.edit_text(
         f"Отозвать ключ <b>{name}</b>?\n<code>{pub_key}</code>",
         parse_mode="HTML",
@@ -338,8 +352,7 @@ async def cb_revoke_confirm(call: CallbackQuery, state: FSMContext) -> None:
 async def cb_back_main(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await call.answer()
-    uid = call.from_user.id
-    await call.message.edit_text("VPN управление:", reply_markup=_menu_for(uid))
+    await call.message.edit_text("VPN управление:", reply_markup=_menu_for(call.from_user.id))
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

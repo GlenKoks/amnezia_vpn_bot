@@ -707,6 +707,13 @@ async def cb_revoke_confirm(call: CallbackQuery, state: FSMContext) -> None:
     )
 
 
+@dp.message(F.sticker)
+async def get_sticker_id(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await message.reply(f"<code>{message.sticker.file_id}</code>", parse_mode="HTML")
+
+
 @dp.callback_query(F.data == "back_main")
 async def cb_back_main(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()

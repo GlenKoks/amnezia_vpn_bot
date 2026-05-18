@@ -240,6 +240,30 @@ async def cmd_start(message: Message) -> None:
 
 # ── Reply keyboard handlers (registered before FSM to take priority) ─────────
 
+def _key_created_dates() -> dict[str, str]:
+    """Return {public_key: formatted_date} from keys_log."""
+    if not Path(KEYS_LOG_FILE).exists():
+        return {}
+    try:
+        with open(KEYS_LOG_FILE) as f:
+            entries = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    result = {}
+    for entry in entries:
+        pk = entry.get("public_key", "")
+        ts = entry.get("timestamp", "")
+        if pk and ts and pk not in result:
+            # timestamp format: "2026-05-18 12:00:00 UTC" → "18.05.2026"
+            try:
+                date_part = ts.split(" ")[0]
+                y, m, d = date_part.split("-")
+                result[pk] = f"{d}.{m}.{y}"
+            except Exception:
+                result[pk] = ts[:10]
+    return result
+
+
 @dp.message(F.text == "📋 Список ключей")
 async def msg_list_peers(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
@@ -255,11 +279,15 @@ async def msg_list_peers(message: Message, state: FSMContext) -> None:
     if not peers:
         await message.answer("Пиров нет.")
         return
+    created = _key_created_dates()
     lines = []
     for p in peers:
         status = "🟢" if p.is_online else "⚫"
+        date_str = created.get(p.public_key)
+        created_line = f"   Создан: {date_str}\n" if date_str else ""
         lines.append(
             f"{status} <b>{p.name}</b> ({p.allowed_ip})\n"
+            f"{created_line}"
             f"   Хэндшейк: {p.handshake_str}  {p.traffic_str}"
         )
     await message.answer("\n\n".join(lines), parse_mode="HTML")
@@ -437,11 +465,15 @@ async def cb_list_peers(call: CallbackQuery) -> None:
         await call.message.edit_text("Пиров нет.")
         return
 
+    created = _key_created_dates()
     lines = []
     for p in peers:
         status = "🟢" if p.is_online else "⚫"
+        date_str = created.get(p.public_key)
+        created_line = f"   Создан: {date_str}\n" if date_str else ""
         lines.append(
             f"{status} <b>{p.name}</b> ({p.allowed_ip})\n"
+            f"{created_line}"
             f"   Хэндшейк: {p.handshake_str}  {p.traffic_str}"
         )
     await call.message.edit_text("\n\n".join(lines), parse_mode="HTML")

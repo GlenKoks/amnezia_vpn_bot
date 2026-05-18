@@ -1,0 +1,11 @@
+app = "amnezia-vpn-bot"
+primary_region = "ams"
+
+[build]
+
+[env]
+  VPN_SSH_PORT = "22"
+  VPN_SSH_USER = "root"
+  VPN_SSH_KEY_PATH = "/app/.ssh/id_ed25519"
+  VPN_INTERFACE = "awg0"
+  VPN_DOCKER_CONTAINER = "amnezia-awg2"

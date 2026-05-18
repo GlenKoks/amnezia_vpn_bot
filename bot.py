@@ -127,6 +127,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📋 Список ключей", callback_data="list_peers")],
         [InlineKeyboardButton(text="➕ Новый ключ", callback_data="add_peer")],
         [InlineKeyboardButton(text="🗑 Отозвать ключ", callback_data="revoke_peer")],
+        [InlineKeyboardButton(text="📜 Лог ключей", callback_data="keys_log")],
     ])
 
 
@@ -303,6 +304,29 @@ async def fsm_add_peer_name(message: Message, state: FSMContext) -> None:
         f"<code>{client_config}</code>",
         parse_mode="HTML",
         reply_markup=_menu_for(message.from_user.id),
+    )
+
+
+# ── Keys log ─────────────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "keys_log")
+async def cb_keys_log(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    await call.answer()
+
+    if not Path(KEYS_LOG_FILE).exists():
+        await call.message.answer("Лог пустой — ключи ещё не выдавались.", reply_markup=main_menu_kb())
+        return
+
+    with open(KEYS_LOG_FILE, "rb") as f:
+        data = f.read()
+
+    await call.message.answer_document(
+        BufferedInputFile(data, filename="keys_log.json"),
+        caption="📜 Полный лог выданных ключей",
+        reply_markup=main_menu_kb(),
     )
 
 

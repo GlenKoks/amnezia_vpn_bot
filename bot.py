@@ -1,6 +1,8 @@
 import io
+import json
 import logging
 import os
+from pathlib import Path
 
 import qrcode
 from aiogram import Bot, Dispatcher, F
@@ -23,6 +25,7 @@ load_dotenv()
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_TELEGRAM_ID"])
+USERS_FILE = os.getenv("USERS_FILE", "/app/data/users.json")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -32,10 +35,46 @@ dp = Dispatcher(storage=MemoryStorage())
 vpn = VPNManager()
 
 
-# ── Auth guard ────────────────────────────────────────────────────────────────
+# ── User store ────────────────────────────────────────────────────────────────
+
+def _load_users() -> set[int]:
+    try:
+        with open(USERS_FILE) as f:
+            return set(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+
+
+def _save_users(users: set[int]) -> None:
+    Path(USERS_FILE).parent.mkdir(parents=True, exist_ok=True)
+    with open(USERS_FILE, "w") as f:
+        json.dump(list(users), f)
+
+
+def add_shared_user(user_id: int) -> None:
+    users = _load_users()
+    users.add(user_id)
+    _save_users(users)
+
+
+def remove_shared_user(user_id: int) -> None:
+    users = _load_users()
+    users.discard(user_id)
+    _save_users(users)
+
+
+def is_shared(user_id: int) -> bool:
+    return user_id in _load_users()
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
 
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
+
+
+def can_generate(user_id: int) -> bool:
+    return is_admin(user_id) or is_shared(user_id)
 
 
 async def deny(message: Message) -> None:
@@ -53,6 +92,10 @@ class RevokePeerForm(StatesGroup):
     waiting_confirm = State()
 
 
+class ShareForm(StatesGroup):
+    waiting_user_id = State()
+
+
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 
 def main_menu_kb() -> InlineKeyboardMarkup:
@@ -63,14 +106,67 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def limited_menu_kb() -> InlineKeyboardMarkup:
+    """Menu for shared users — generate keys only."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Новый ключ", callback_data="add_peer")],
+    ])
+
+
+def _menu_for(user_id: int) -> InlineKeyboardMarkup:
+    return main_menu_kb() if is_admin(user_id) else limited_menu_kb()
+
+
 # ── /start ────────────────────────────────────────────────────────────────────
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message) -> None:
+    uid = message.from_user.id
+    if is_admin(uid):
+        await message.answer("VPN управление:", reply_markup=main_menu_kb())
+    elif is_shared(uid):
+        await message.answer("VPN управление:", reply_markup=limited_menu_kb())
+    else:
+        await deny(message)
+
+
+# ── /share ────────────────────────────────────────────────────────────────────
+
+@dp.message(Command("share"))
+async def cmd_share(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
         await deny(message)
         return
-    await message.answer("VPN управление:", reply_markup=main_menu_kb())
+    await message.answer(
+        "Введите Telegram ID пользователя, которому хотите дать доступ к генерации ключей.\n\n"
+        "Пользователь может узнать свой ID через @userinfobot"
+    )
+    await state.set_state(ShareForm.waiting_user_id)
+
+
+@dp.message(ShareForm.waiting_user_id)
+async def fsm_share_user_id(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await deny(message)
+        return
+    try:
+        user_id = int(message.text.strip())
+    except ValueError:
+        await message.answer("Некорректный ID — введите число:")
+        return
+    if user_id == ADMIN_ID:
+        await message.answer("Это ваш собственный ID.", reply_markup=main_menu_kb())
+        await state.clear()
+        return
+    add_shared_user(user_id)
+    await state.clear()
+    await message.answer(
+        f"✅ Пользователь <code>{user_id}</code> получил доступ к генерации ключей.\n"
+        f"Пусть напишет боту /start",
+        parse_mode="HTML",
+        reply_markup=main_menu_kb(),
+    )
+    log.info("Admin granted access to user %s", user_id)
 
 
 # ── List peers ────────────────────────────────────────────────────────────────
@@ -100,15 +196,14 @@ async def cb_list_peers(call: CallbackQuery) -> None:
             f"{status} <b>{p.name}</b> ({p.allowed_ip})\n"
             f"   Хэндшейк: {p.handshake_str}  {p.traffic_str}"
         )
-    text = "\n\n".join(lines)
-    await call.message.edit_text(text, parse_mode="HTML", reply_markup=main_menu_kb())
+    await call.message.edit_text("\n\n".join(lines), parse_mode="HTML", reply_markup=main_menu_kb())
 
 
 # ── Add peer ──────────────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data == "add_peer")
 async def cb_add_peer(call: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin(call.from_user.id):
+    if not can_generate(call.from_user.id):
         await call.answer("Нет доступа.", show_alert=True)
         return
     await call.answer()
@@ -118,7 +213,7 @@ async def cb_add_peer(call: CallbackQuery, state: FSMContext) -> None:
 
 @dp.message(AddPeerForm.waiting_name)
 async def fsm_add_peer_name(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
+    if not can_generate(message.from_user.id):
         await deny(message)
         return
     name = message.text.strip()
@@ -132,10 +227,9 @@ async def fsm_add_peer_name(message: Message, state: FSMContext) -> None:
         client_config, pub_key = await vpn.add_peer(name)
     except Exception as e:
         log.exception("add_peer failed")
-        await status_msg.edit_text(f"Ошибка: {e}", reply_markup=main_menu_kb())
+        await status_msg.edit_text(f"Ошибка: {e}", reply_markup=_menu_for(message.from_user.id))
         return
 
-    # Generate QR code
     qr = qrcode.make(client_config)
     buf = io.BytesIO()
     qr.save(buf, format="PNG")
@@ -150,7 +244,7 @@ async def fsm_add_peer_name(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"<code>{client_config}</code>",
         parse_mode="HTML",
-        reply_markup=main_menu_kb(),
+        reply_markup=_menu_for(message.from_user.id),
     )
 
 
@@ -193,8 +287,6 @@ async def cb_revoke_select(call: CallbackQuery, state: FSMContext) -> None:
         await call.answer("Нет доступа.", show_alert=True)
         return
     pub_key = call.data.split(":", 1)[1]
-
-    # Find peer name
     try:
         peers = await vpn.list_peers()
     except Exception as e:
@@ -246,15 +338,11 @@ async def cb_revoke_confirm(call: CallbackQuery, state: FSMContext) -> None:
 async def cb_back_main(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await call.answer()
-    await call.message.edit_text("VPN управление:", reply_markup=main_menu_kb())
+    uid = call.from_user.id
+    await call.message.edit_text("VPN управление:", reply_markup=_menu_for(uid))
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
-
-@dp.message()
-async def catch_all(message: Message) -> None:
-    log.info("Received message from %s (id=%s): %s", message.from_user.username, message.from_user.id, message.text)
-
 
 @dp.errors()
 async def error_handler(event, exception: Exception) -> None:

@@ -458,6 +458,17 @@ async def fsm_add_peer_name(message: Message, state: FSMContext) -> None:
     issuer_username = f"@{user.username}" if user.username else "нет"
     _log_key_issued(name, pub_key, allowed_ip, user.id, issuer_name, issuer_username)
 
+    if not is_admin(user.id):
+        user_display = issuer_username if issuer_username != "нет" else issuer_name
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"🔑 <b>{user_display}</b> ({issuer_name}) получил новый ключ: <b>{name}</b>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            log.exception("Failed to notify admin about new key")
+
     qr = qrcode.make(client_config)
     buf = io.BytesIO()
     qr.save(buf, format="PNG")
@@ -563,40 +574,40 @@ async def cb_user_detail(call: CallbackQuery, state: FSMContext) -> None:
 
     active_peers = {p.public_key: p for p in peers}
 
-    # Sort: active peers (by handshake asc) first, then revoked
-    def sort_key(entry: dict) -> tuple:
-        p = active_peers.get(entry.get("public_key", ""))
-        if p:
-            return (0, p.last_handshake)
-        return (1, 0)
+    # Only active peers from this user's log, sorted by handshake asc
+    active_entries = sorted(
+        [e for e in user_log_entries if e.get("public_key", "") in active_peers],
+        key=lambda e: active_peers[e["public_key"]].last_handshake,
+    )
 
-    sorted_entries = sorted(user_log_entries, key=sort_key)
+    if not active_entries:
+        await call.message.edit_text(
+            f"👤 <b>{name}</b> {username}\n\nАктивных ключей нет.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="← Назад", callback_data="users_list"),
+            ]]),
+        )
+        return
 
     lines = [f"👤 <b>{name}</b> {username}"]
     buttons = []
-    has_active = False
-    for entry in sorted_entries:
+    for entry in active_entries:
         pubkey = entry.get("public_key", "")
-        key_name = entry.get("key_name", pubkey[:12])
-        peer = active_peers.get(pubkey)
-        if peer:
-            has_active = True
-            status = "🟢" if peer.is_online else "⚫"
-            lines.append(
-                f"\n{status} <b>{peer.name}</b> ({peer.allowed_ip})\n"
-                f"Хэндшейк: {peer.handshake_str} · {peer.traffic_str}"
-            )
-            buttons.append([InlineKeyboardButton(
-                text=f"🗑 Отозвать {peer.name}",
-                callback_data=f"revoke_select:{pubkey}",
-            )])
-        else:
-            lines.append(f"\n🚫 <b>{key_name}</b> — отозван")
+        peer = active_peers[pubkey]
+        status = "🟢" if peer.is_online else "⚫"
+        lines.append(
+            f"\n{status} <b>{peer.name}</b> ({peer.allowed_ip})\n"
+            f"Хэндшейк: {peer.handshake_str} · {peer.traffic_str}"
+        )
+        buttons.append([InlineKeyboardButton(
+            text=f"🗑 Отозвать {peer.name}",
+            callback_data=f"revoke_select:{pubkey}",
+        )])
 
     buttons.append([InlineKeyboardButton(text="← Назад", callback_data="users_list")])
-    if has_active:
-        await state.update_data(back_to=f"user_detail:{uid_str}")
-        await state.set_state(RevokePeerForm.waiting_choice)
+    await state.update_data(back_to=f"user_detail:{uid_str}")
+    await state.set_state(RevokePeerForm.waiting_choice)
 
     await call.message.edit_text(
         "\n".join(lines),

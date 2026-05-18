@@ -319,40 +319,62 @@ async def msg_keys_log(message: Message, state: FSMContext) -> None:
     )
 
 
-@dp.message(F.text == "👥 Пользователи")
-async def msg_users_list(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
-        return
-    await state.clear()
-    users = _enrich_users_from_log(_load_users())
-    if not users:
-        await message.answer("Пользователей с доступом нет.")
-        return
-    keys_count: dict[str, int] = {}
+async def _users_list_keyboard() -> tuple[str, InlineKeyboardMarkup] | tuple[str, None]:
+    """Return (text, keyboard) for the users list built from active VPN peers."""
+    try:
+        peers = await vpn.list_peers()
+    except Exception as e:
+        return f"Ошибка получения пиров: {e}", None
+
+    active_pubkeys = {p.public_key for p in peers}
+
+    # Load log entries for active peers only, group by issuer
+    issuers: dict[str, dict] = {}  # uid_str -> {name, username, count}
     if Path(KEYS_LOG_FILE).exists():
         try:
             with open(KEYS_LOG_FILE) as f:
                 for entry in json.load(f):
+                    if entry.get("public_key") not in active_pubkeys:
+                        continue
                     uid_str = str(entry.get("issued_by_id", ""))
-                    keys_count[uid_str] = keys_count.get(uid_str, 0) + 1
+                    if not uid_str:
+                        continue
+                    if uid_str not in issuers:
+                        issuers[uid_str] = {
+                            "name": entry.get("issued_by_name", "—") or "—",
+                            "username": entry.get("issued_by_username", "") or "",
+                            "count": 0,
+                        }
+                    issuers[uid_str]["count"] += 1
         except (json.JSONDecodeError, OSError):
             pass
+
+    if not issuers:
+        return "Активных ключей нет.", None
+
     buttons = []
-    for uid_str, info in users.items():
-        name = info.get("name", "—")
-        username = info.get("username", "")
-        count = keys_count.get(uid_str, 0)
+    for uid_str, info in issuers.items():
+        name = info["name"]
+        username = info["username"]
+        count = info["count"]
         label = "1 ключ" if count == 1 else f"{count} ключей"
         display = f"{name} {username}".strip() if username else name
         buttons.append([InlineKeyboardButton(
             text=f"👤 {display} — {label}",
             callback_data=f"user_detail:{uid_str}",
         )])
-    await message.answer(
-        f"<b>👥 Пользователи с доступом: {len(users)}</b>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-    )
+
+    text = f"<b>👥 Пользователи с активными ключами: {len(issuers)}</b>"
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@dp.message(F.text == "👥 Пользователи")
+async def msg_users_list(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    text, kb = await _users_list_keyboard()
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
 # ── Access approve / deny ─────────────────────────────────────────────────────
@@ -504,40 +526,14 @@ async def cb_users_list(call: CallbackQuery) -> None:
         return
     await call.answer()
 
-    users = _enrich_users_from_log(_load_users())
-    if not users:
-        await call.message.edit_text("Пользователей с доступом нет.")
+    text, kb = await _users_list_keyboard()
+    if kb is None:
+        await call.message.edit_text(text, parse_mode="HTML")
         return
 
-    # Count issued keys per user from log
-    keys_count: dict[str, int] = {}
-    if Path(KEYS_LOG_FILE).exists():
-        try:
-            with open(KEYS_LOG_FILE) as f:
-                for entry in json.load(f):
-                    uid_str = str(entry.get("issued_by_id", ""))
-                    keys_count[uid_str] = keys_count.get(uid_str, 0) + 1
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    buttons = []
-    for uid_str, info in users.items():
-        name = info.get("name", "—")
-        username = info.get("username", "")
-        count = keys_count.get(uid_str, 0)
-        label = f"1 ключ" if count == 1 else f"{count} ключей"
-        display = f"{name} {username}".strip() if username else name
-        buttons.append([InlineKeyboardButton(
-            text=f"👤 {display} — {label}",
-            callback_data=f"user_detail:{uid_str}",
-        )])
-    buttons.append([InlineKeyboardButton(text="← Назад", callback_data="back_main")])
-
-    await call.message.edit_text(
-        f"<b>👥 Пользователи с доступом: {len(users)}</b>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-    )
+    # Add back button
+    kb.inline_keyboard.append([InlineKeyboardButton(text="← Назад", callback_data="back_main")])
+    await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
 
 @dp.callback_query(F.data.startswith("user_detail:"))

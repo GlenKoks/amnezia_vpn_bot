@@ -689,6 +689,10 @@ async def cb_revoke_confirm(call: CallbackQuery, state: FSMContext) -> None:
                 f"🚫 Ваш ключ <b>{name}</b> был отозван администратором.",
                 parse_mode="HTML",
             )
+            await bot.send_sticker(
+                owner_id,
+                sticker="AAMCAgADGQEAAUn1T2oLAkfY7kP1AmO17Z6RPlQ8reBqAAKSZAACmAw4SebAkkZJD2F3AQAHbQADOwQ",
+            )
         except Exception:
             log.exception("Failed to notify key owner about revocation")
 

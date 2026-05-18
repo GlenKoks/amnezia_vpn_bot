@@ -351,10 +351,12 @@ async def cb_users_list(call: CallbackQuery) -> None:
     buttons = []
     for uid_str, info in users.items():
         name = info.get("name", "—")
+        username = info.get("username", "")
         count = keys_count.get(uid_str, 0)
         label = f"1 ключ" if count == 1 else f"{count} ключей"
+        display = f"{name} {username}".strip() if username else name
         buttons.append([InlineKeyboardButton(
-            text=f"👤 {name} — {label}",
+            text=f"👤 {display} — {label}",
             callback_data=f"user_detail:{uid_str}",
         )])
     buttons.append([InlineKeyboardButton(text="← Назад", callback_data="back_main")])

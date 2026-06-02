@@ -542,8 +542,10 @@ async def fsm_add_peer_name(message: Message, state: FSMContext) -> None:
         caption=f"<b>{name}</b>\nPublicKey: <code>{pub_key}</code>",
         parse_mode="HTML",
     )
-    await message.answer(
-        f"<code>{client_config}</code>",
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+    await message.answer_document(
+        BufferedInputFile(client_config.encode(), filename=f"{safe_name}.conf"),
+        caption=f"<b>{name}</b>\nPublicKey: <code>{pub_key}</code>",
         parse_mode="HTML",
         reply_markup=_menu_for(message.from_user.id),
     )

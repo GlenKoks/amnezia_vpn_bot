@@ -16,6 +16,7 @@ load_dotenv()
 VPN_HOST = os.getenv("VPN_HOST", "")
 VPN_INTERFACE = os.getenv("VPN_INTERFACE", "awg0")
 VPN_DOCKER_CONTAINER = os.getenv("VPN_DOCKER_CONTAINER", "amnezia-awg2")
+VPN_DNS = os.getenv("VPN_DNS", "1.1.1.1")
 VPN_MODE = os.getenv("VPN_MODE", "docker")  # "docker" or "host"
 CONF_PATH = os.getenv("CONF_PATH", (
     f"/etc/amnezia/amneziawg/{VPN_INTERFACE}.conf"
@@ -131,7 +132,7 @@ class VPNManager:
             f"[Interface]\n"
             f"PrivateKey = {priv_key}\n"
             f"Address = {client_ip}/32\n"
-            f"DNS = 1.1.1.1\n"
+            f"DNS = {VPN_DNS}\n"
         )
         if amnezia_lines:
             client_config += amnezia_lines + "\n"

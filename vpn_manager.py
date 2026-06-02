@@ -3,12 +3,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import ipaddress
+import os
 import re
+import subprocess
 import time
 from dataclasses import dataclass
 
-import docker
-import os
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,7 +16,12 @@ load_dotenv()
 VPN_HOST = os.getenv("VPN_HOST", "")
 VPN_INTERFACE = os.getenv("VPN_INTERFACE", "awg0")
 VPN_DOCKER_CONTAINER = os.getenv("VPN_DOCKER_CONTAINER", "amnezia-awg2")
-CONF_PATH = f"/opt/amnezia/awg/{VPN_INTERFACE}.conf"
+VPN_MODE = os.getenv("VPN_MODE", "docker")  # "docker" or "host"
+CONF_PATH = os.getenv("CONF_PATH", (
+    f"/etc/amnezia/amneziawg/{VPN_INTERFACE}.conf"
+    if VPN_MODE == "host"
+    else f"/opt/amnezia/awg/{VPN_INTERFACE}.conf"
+))
 
 AMNEZIA_KEYS = ["Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4"]
 
@@ -64,12 +69,22 @@ class PeerInfo:
 
 class VPNManager:
     def _exec(self, cmd: str) -> str:
-        client = docker.from_env()
-        container = client.containers.get(VPN_DOCKER_CONTAINER)
-        exit_code, output = container.exec_run(["sh", "-c", cmd])
-        if exit_code != 0:
-            raise RuntimeError(output.decode().strip())
-        return output.decode().strip()
+        if VPN_MODE == "host":
+            result = subprocess.run(
+                ["sh", "-c", cmd],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+            return result.stdout.strip()
+        else:
+            import docker
+            client = docker.from_env()
+            container = client.containers.get(VPN_DOCKER_CONTAINER)
+            exit_code, output = container.exec_run(["sh", "-c", cmd])
+            if exit_code != 0:
+                raise RuntimeError(output.decode().strip())
+            return output.decode().strip()
 
     async def _run(self, cmd: str) -> str:
         return await asyncio.to_thread(self._exec, cmd)

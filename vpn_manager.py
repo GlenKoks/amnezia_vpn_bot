@@ -159,6 +159,7 @@ class VPNManager:
             f"PrivateKey = {priv_key}\n"
             f"Address = {client_ip}/32\n"
             f"DNS = {VPN_DNS}\n"
+            f"MTU = 1420\n"
         )
         if amnezia_lines:
             client_config += amnezia_lines + "\n"

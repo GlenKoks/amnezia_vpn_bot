@@ -3,12 +3,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import ipaddress
+import os
 import re
+import subprocess
 import time
 from dataclasses import dataclass
 
-import docker
-import os
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,9 +16,45 @@ load_dotenv()
 VPN_HOST = os.getenv("VPN_HOST", "")
 VPN_INTERFACE = os.getenv("VPN_INTERFACE", "awg0")
 VPN_DOCKER_CONTAINER = os.getenv("VPN_DOCKER_CONTAINER", "amnezia-awg2")
-CONF_PATH = f"/opt/amnezia/awg/{VPN_INTERFACE}.conf"
+VPN_DNS = os.getenv("VPN_DNS", "1.1.1.1")
+VPN_MODE = os.getenv("VPN_MODE", "docker")  # "docker" or "host"
+VPN_EXCLUDED_IPS = os.getenv("VPN_EXCLUDED_IPS", "")  # comma-separated CIDRs to bypass VPN
+CONF_PATH = os.getenv("CONF_PATH", (
+    f"/etc/amnezia/amneziawg/{VPN_INTERFACE}.conf"
+    if VPN_MODE == "host"
+    else f"/opt/amnezia/awg/{VPN_INTERFACE}.conf"
+))
 
 AMNEZIA_KEYS = ["Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4"]
+
+
+def _compute_allowed_ips(excluded_cidrs_str: str) -> str:
+    """Return AllowedIPs string covering 0.0.0.0/0 minus the given excluded CIDRs.
+
+    IPv6 (::/0) is intentionally excluded from the default to avoid timeouts
+    on servers without IPv6 routing. Sites like GitHub have AAAA records and
+    browsers try IPv6 first — if the VPN server can't route IPv6, connections hang.
+    """
+    excluded_cidrs = [c.strip() for c in excluded_cidrs_str.split(",") if c.strip()]
+    if not excluded_cidrs:
+        return "0.0.0.0/0"
+
+    remaining: list[ipaddress.IPv4Network] = [ipaddress.ip_network("0.0.0.0/0")]
+    for cidr in excluded_cidrs:
+        try:
+            excluded = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            continue
+        new_remaining: list[ipaddress.IPv4Network] = []
+        for net in remaining:
+            try:
+                new_remaining.extend(net.address_exclude(excluded))
+            except ValueError:
+                new_remaining.append(net)
+        remaining = new_remaining
+
+    remaining.sort()
+    return ", ".join(str(n) for n in remaining)
 
 
 @dataclass
@@ -64,12 +100,22 @@ class PeerInfo:
 
 class VPNManager:
     def _exec(self, cmd: str) -> str:
-        client = docker.from_env()
-        container = client.containers.get(VPN_DOCKER_CONTAINER)
-        exit_code, output = container.exec_run(["sh", "-c", cmd])
-        if exit_code != 0:
-            raise RuntimeError(output.decode().strip())
-        return output.decode().strip()
+        if VPN_MODE == "host":
+            result = subprocess.run(
+                ["sh", "-c", cmd],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+            return result.stdout.strip()
+        else:
+            import docker
+            client = docker.from_env()
+            container = client.containers.get(VPN_DOCKER_CONTAINER)
+            exit_code, output = container.exec_run(["sh", "-c", cmd])
+            if exit_code != 0:
+                raise RuntimeError(output.decode().strip())
+            return output.decode().strip()
 
     async def _run(self, cmd: str) -> str:
         return await asyncio.to_thread(self._exec, cmd)
@@ -116,7 +162,8 @@ class VPNManager:
             f"[Interface]\n"
             f"PrivateKey = {priv_key}\n"
             f"Address = {client_ip}/32\n"
-            f"DNS = 1.1.1.1\n"
+            f"DNS = {VPN_DNS}\n"
+            f"MTU = 1420\n"
         )
         if amnezia_lines:
             client_config += amnezia_lines + "\n"
@@ -125,7 +172,7 @@ class VPNManager:
             f"PublicKey = {server_pubkey}\n"
             f"PresharedKey = {psk}\n"
             f"Endpoint = {VPN_HOST}:{srv['listen_port']}\n"
-            f"AllowedIPs = 0.0.0.0/0, ::/0\n"
+            f"AllowedIPs = {_compute_allowed_ips(VPN_EXCLUDED_IPS)}\n"
             f"PersistentKeepalive = 25\n"
         )
         return client_config, pub_key

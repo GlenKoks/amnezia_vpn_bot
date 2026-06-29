@@ -29,10 +29,15 @@ AMNEZIA_KEYS = ["Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", 
 
 
 def _compute_allowed_ips(excluded_cidrs_str: str) -> str:
-    """Return AllowedIPs string covering 0.0.0.0/0 minus the given excluded CIDRs."""
+    """Return AllowedIPs string covering 0.0.0.0/0 minus the given excluded CIDRs.
+
+    IPv6 (::/0) is intentionally excluded from the default to avoid timeouts
+    on servers without IPv6 routing. Sites like GitHub have AAAA records and
+    browsers try IPv6 first — if the VPN server can't route IPv6, connections hang.
+    """
     excluded_cidrs = [c.strip() for c in excluded_cidrs_str.split(",") if c.strip()]
     if not excluded_cidrs:
-        return "0.0.0.0/0, ::/0"
+        return "0.0.0.0/0"
 
     remaining: list[ipaddress.IPv4Network] = [ipaddress.ip_network("0.0.0.0/0")]
     for cidr in excluded_cidrs:
@@ -49,8 +54,7 @@ def _compute_allowed_ips(excluded_cidrs_str: str) -> str:
         remaining = new_remaining
 
     remaining.sort()
-    ipv4_part = ", ".join(str(n) for n in remaining)
-    return f"{ipv4_part}, ::/0"
+    return ", ".join(str(n) for n in remaining)
 
 
 @dataclass

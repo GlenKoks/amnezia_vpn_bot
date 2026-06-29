@@ -18,6 +18,7 @@ VPN_INTERFACE = os.getenv("VPN_INTERFACE", "awg0")
 VPN_DOCKER_CONTAINER = os.getenv("VPN_DOCKER_CONTAINER", "amnezia-awg2")
 VPN_DNS = os.getenv("VPN_DNS", "1.1.1.1")
 VPN_MODE = os.getenv("VPN_MODE", "docker")  # "docker" or "host"
+VPN_EXCLUDED_IPS = os.getenv("VPN_EXCLUDED_IPS", "")  # comma-separated CIDRs to bypass VPN
 CONF_PATH = os.getenv("CONF_PATH", (
     f"/etc/amnezia/amneziawg/{VPN_INTERFACE}.conf"
     if VPN_MODE == "host"
@@ -25,6 +26,31 @@ CONF_PATH = os.getenv("CONF_PATH", (
 ))
 
 AMNEZIA_KEYS = ["Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4"]
+
+
+def _compute_allowed_ips(excluded_cidrs_str: str) -> str:
+    """Return AllowedIPs string covering 0.0.0.0/0 minus the given excluded CIDRs."""
+    excluded_cidrs = [c.strip() for c in excluded_cidrs_str.split(",") if c.strip()]
+    if not excluded_cidrs:
+        return "0.0.0.0/0, ::/0"
+
+    remaining: list[ipaddress.IPv4Network] = [ipaddress.ip_network("0.0.0.0/0")]
+    for cidr in excluded_cidrs:
+        try:
+            excluded = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            continue
+        new_remaining: list[ipaddress.IPv4Network] = []
+        for net in remaining:
+            try:
+                new_remaining.extend(net.address_exclude(excluded))
+            except ValueError:
+                new_remaining.append(net)
+        remaining = new_remaining
+
+    remaining.sort()
+    ipv4_part = ", ".join(str(n) for n in remaining)
+    return f"{ipv4_part}, ::/0"
 
 
 @dataclass
@@ -141,7 +167,7 @@ class VPNManager:
             f"PublicKey = {server_pubkey}\n"
             f"PresharedKey = {psk}\n"
             f"Endpoint = {VPN_HOST}:{srv['listen_port']}\n"
-            f"AllowedIPs = 0.0.0.0/0, ::/0\n"
+            f"AllowedIPs = {_compute_allowed_ips(VPN_EXCLUDED_IPS)}\n"
             f"PersistentKeepalive = 25\n"
         )
         return client_config, pub_key
